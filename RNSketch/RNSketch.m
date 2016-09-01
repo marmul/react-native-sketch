@@ -5,6 +5,9 @@
 //  Created by Jeremy Grancher on 28/04/2016.
 //  Copyright © 2016 Jeremy Grancher. All rights reserved.
 //
+//  Modified for multi touch by Martin Müller on 01/09/2016.
+//  Modifications Copyright © 2016 Martin Müller. All rights reserved.
+//
 
 #import "RNSketch.h"
 #import "RNSketchManager.h"
@@ -12,21 +15,107 @@
 #import "RCTView.h"
 #import "UIView+React.h"
 
+@interface PathCreator : NSObject
+
+@property bool needsDraw;
+@property UIBezierPath* _path;
+
+-(instancetype)init;
+-(void)beginPoint:(CGPoint)point;
+-(void)addPoint:(CGPoint)point;
+-(void)clear;
+-(void)finish;
+-(void)stroke;
+-(void)setOffest:(CGPoint)point;
+-(CGPoint)lastPoint;
+
+@end
+
+@implementation PathCreator
+{
+  //UIBezierPath *_path;
+  CGPoint _points[5];
+  uint _counter;
+  CGPoint _offset;
+}
+
+-(instancetype)init{
+  self = [super init];
+  self._path = [UIBezierPath bezierPath];
+  _counter = 0;
+  _offset = CGPointMake(0,0);
+  return self;
+}
+
+-(void)beginPoint:(CGPoint)point {
+  _points[0] = CGPointMake(point.x + _offset.x, point.y + _offset.y );
+  _counter = 1;
+}
+
+-(void)addPoint:(CGPoint)point {
+  _points[_counter] = CGPointMake(point.x + _offset.x, point.y + _offset.y );
+  _counter++;
+  if (_counter >=5) [self finish];
+}
+
+-(void)clear {
+  _counter = 0;
+  self.needsDraw = false;
+  [self._path removeAllPoints];
+}
+
+-(void)finish {
+  // Move the endpoint to the middle of the line
+  _points[3] = CGPointMake((_points[2].x + _points[4].x) / 2, (_points[2].y + _points[4].y) / 2);
+  
+  [self._path moveToPoint:_points[0]];
+  [self._path addCurveToPoint:_points[3] controlPoint1:_points[1] controlPoint2:_points[2]];
+  
+  self.needsDraw = true;
+  
+  // Replace points and get ready to handle the next segment
+  _points[0] = _points[3];
+  _points[1] = _points[4];
+  _counter = 2;
+}
+
+-(void)stroke {
+  [self._path stroke];
+}
+
+-(void)setOffest:(CGPoint)point {
+  _offset = point;
+}
+
+-(CGPoint)lastPoint {
+  if (_counter>0) return _points[_counter - 1];
+  else return CGPointMake(0,0); //just returning some default
+}
+
+@end
+
+//Quick UIColor creation for debugging:
+#define UIColorFromRGB(rgbValue) \
+[UIColor colorWithRed:((float)((rgbValue & 0xFF0000) >> 16))/255.0 \
+green:((float)((rgbValue & 0x00FF00) >>  8))/255.0 \
+blue:((float)((rgbValue & 0x0000FF) >>  0))/255.0 \
+alpha:1.0]
+
+
 @implementation RNSketch
 {
   // Internal
   RCTEventDispatcher *_eventDispatcher;
   UIButton *_clearButton;
-  UIBezierPath *_path;
   UIImage *_image;
-  CGPoint _points[5];
-  uint _counter;
-
+  
+  NSMutableDictionary* _pathCreatorForTouch;
+  
   // Configuration settings
   UIColor *_fillColor;
   UIColor *_strokeColor;
+  int _strokeThickness;
 }
-
 
 #pragma mark - UIViewHierarchy methods
 
@@ -35,10 +124,10 @@
 {
   if ((self = [super init])) {
     // Internal setup
-    self.multipleTouchEnabled = NO;
+    self.multipleTouchEnabled = YES;
     _eventDispatcher = eventDispatcher;
-    _path = [UIBezierPath bezierPath];
-
+    _pathCreatorForTouch = [[NSMutableDictionary alloc] init];
+    
     // TODO: Find a way to get an functionnal external 'clear button'
     [self initClearButton];
   }
@@ -83,18 +172,50 @@
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
-  _counter = 0;
-  UITouch *touch = [touches anyObject];
-  _points[0] = [touch locationInView:self];
+  [self beginPathCreatorForTouches: touches];
+}
+
+- (void)beginPathCreatorForTouches:(NSSet *)touches {
+  if ([touches count] > 0) {
+    for (UITouch *touch in touches) {
+      NSValue *key = [NSValue value:&touch withObjCType:@encode(void *)];
+      PathCreator *pc = [[PathCreator alloc] init];
+      pc._path.lineWidth = _strokeThickness;
+      [_pathCreatorForTouch setObject:pc forKey:key];
+      
+      [pc beginPoint: [touch locationInView:self]];
+    }
+  }
+}
+
+- (void)movePathCreatorForTouches:(NSSet *)touches {
+  if ([touches count] > 0) {
+    for (UITouch *touch in touches) {
+      NSValue *key = [NSValue value:&touch withObjCType:@encode(void *)];
+
+      PathCreator *pc = [_pathCreatorForTouch objectForKey:key];
+      
+      [pc addPoint: [touch locationInView:self]];
+      if ([pc needsDraw]) [self setNeedsDisplay];
+    }
+  }
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
-  _counter++;
-  UITouch *touch = [touches anyObject];
-  _points[_counter] = [touch locationInView:self];
+  [self movePathCreatorForTouches: touches];
+}
 
-  if (_counter == 4) [self drawCurve];
+- (void)removePathCreatorForTouches:(NSSet *)touches {
+  if ([touches count] > 0) {
+    for (UITouch *touch in touches) {
+      NSValue *key = [NSValue value:&touch withObjCType:@encode(void *)];
+      PathCreator *pc = [_pathCreatorForTouch objectForKey:key];
+      [pc clear];
+      [_pathCreatorForTouch removeObjectForKey:key];
+      //no deallocation here due to ARC
+    }
+  }
 }
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -104,10 +225,9 @@
 
   [self drawBitmap];
   [self setNeedsDisplay];
-
-  [_path removeAllPoints];
-  _counter = 0;
-
+  
+  [self removePathCreatorForTouches: touches];
+  
   // Send event
   NSDictionary *bodyEvent = @{
                               @"target": self.reactTag,
@@ -129,28 +249,15 @@
 {
   [_image drawInRect:rect];
   [_strokeColor setStroke];
-  [_path stroke];
+  for(id key in _pathCreatorForTouch) {
+    id pc = [_pathCreatorForTouch objectForKey:key];
+    [pc stroke];
+    //[UIColorFromRGB(0xFF0000) setStroke]; //for debug: switch color to red for remaining touches
+  }
 }
 
 
 #pragma mark - Drawing methods
-
-
-- (void)drawCurve
-{
-  // Move the endpoint to the middle of the line
-  _points[3] = CGPointMake((_points[2].x + _points[4].x) / 2, (_points[2].y + _points[4].y) / 2);
-
-  [_path moveToPoint:_points[0]];
-  [_path addCurveToPoint:_points[3] controlPoint1:_points[1] controlPoint2:_points[2]];
-
-  [self setNeedsDisplay];
-
-  // Replace points and get ready to handle the next segment
-  _points[0] = _points[3];
-  _points[1] = _points[4];
-  _counter = 1;
-}
 
 - (void)drawBitmap
 {
@@ -165,7 +272,12 @@
   // Draw with context
   [_image drawAtPoint:CGPointZero];
   [_strokeColor setStroke];
-  [_path stroke];
+  for(id key in _pathCreatorForTouch) {
+    id pc = [_pathCreatorForTouch objectForKey:key];
+    [pc stroke];
+    //[UIColorFromRGB(0xFF0000) setStroke]; //for debug: switch color to red for remaining touches
+  }
+  
   _image = UIGraphicsGetImageFromCurrentImageContext();
 
   UIGraphicsEndImageContext();
@@ -217,7 +329,7 @@
 
 - (void)setStrokeThickness:(NSInteger)strokeThickness
 {
-  _path.lineWidth = strokeThickness;
+  _strokeThickness = strokeThickness;
 }
 
 @end
